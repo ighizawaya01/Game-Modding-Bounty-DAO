@@ -7,13 +7,19 @@
 (define-constant ERR_BOUNTY_EXPIRED (err u410))
 (define-constant ERR_BOUNTY_ACTIVE (err u411))
 (define-constant ERR_NOT_MEMBER (err u405))
+(define-constant ERR_MILESTONE_NOT_FOUND (err u406))
+(define-constant ERR_MILESTONE_COMPLETED (err u407))
+(define-constant ERR_INVALID_MILESTONE (err u408))
+(define-constant ERR_MILESTONE_NOT_SUBMITTED (err u409))
 (define-constant MIN_BOUNTY_AMOUNT u1000000)
 (define-constant VOTING_PERIOD u1008)
 (define-constant MIN_VOTES_REQUIRED u3)
+(define-constant MAX_MILESTONES u10)
 
 (define-data-var next-bounty-id uint u1)
 (define-data-var dao-treasury uint u0)
 (define-data-var total-members uint u0)
+(define-data-var next-milestone-bounty-id uint u1)
 
 (define-map bounties
   { bounty-id: uint }
@@ -58,6 +64,34 @@
 (define-map treasury-contributions
   { contributor: principal }
   { total-contributed: uint, last-contribution: uint }
+)
+
+(define-map milestone-bounties
+  { bounty-id: uint }
+  {
+    creator: principal,
+    title: (string-ascii 100),
+    description: (string-ascii 500),
+    total-reward: uint,
+    assignee: principal,
+    total-milestones: uint,
+    completed-milestones: uint,
+    created-at: uint,
+    status: (string-ascii 20)
+  }
+)
+
+(define-map milestones
+  { bounty-id: uint, milestone-index: uint }
+  {
+    description: (string-ascii 300),
+    reward-amount: uint,
+    deadline: uint,
+    status: (string-ascii 20),
+    submission-url: (optional (string-ascii 200)),
+    submitted-at: (optional uint),
+    completed-at: (optional uint)
+  }
 )
 
 (define-public (join-dao)
@@ -280,4 +314,196 @@
 
 (define-read-only (has-voted (bounty-id uint) (voter principal) (submitter principal))
   (is-some (map-get? bounty-votes { bounty-id: bounty-id, voter: voter, submitter: submitter }))
+)
+
+(define-public (create-milestone-bounty 
+  (title (string-ascii 100)) 
+  (description (string-ascii 500)) 
+  (assignee principal)
+  (milestone-descriptions (list 10 (string-ascii 300)))
+  (milestone-rewards (list 10 uint))
+  (milestone-deadlines (list 10 uint)))
+  (let (
+    (bounty-id (var-get next-milestone-bounty-id))
+    (num-milestones (len milestone-descriptions))
+    (total-reward (fold + milestone-rewards u0))
+  )
+    (asserts! (is-some (map-get? member-registry { member: tx-sender })) ERR_NOT_MEMBER)
+    (asserts! (is-some (map-get? member-registry { member: assignee })) ERR_NOT_MEMBER)
+    (asserts! (and (> num-milestones u0) (<= num-milestones MAX_MILESTONES)) ERR_INVALID_MILESTONE)
+    (asserts! (is-eq num-milestones (len milestone-rewards)) ERR_INVALID_MILESTONE)
+    (asserts! (is-eq num-milestones (len milestone-deadlines)) ERR_INVALID_MILESTONE)
+    (asserts! (>= total-reward MIN_BOUNTY_AMOUNT) ERR_INVALID_AMOUNT)
+    (asserts! (>= (var-get dao-treasury) total-reward) ERR_INSUFFICIENT_FUNDS)
+    
+    (map-set milestone-bounties
+      { bounty-id: bounty-id }
+      {
+        creator: tx-sender,
+        title: title,
+        description: description,
+        total-reward: total-reward,
+        assignee: assignee,
+        total-milestones: num-milestones,
+        completed-milestones: u0,
+        created-at: stacks-block-height,
+        status: "active"
+      }
+    )
+    
+    (map create-milestone-entry 
+      milestone-descriptions 
+      milestone-rewards 
+      milestone-deadlines 
+      (list bounty-id bounty-id bounty-id bounty-id bounty-id bounty-id bounty-id bounty-id bounty-id bounty-id)
+      (list u0 u1 u2 u3 u4 u5 u6 u7 u8 u9))
+    
+    (var-set next-milestone-bounty-id (+ bounty-id u1))
+    (var-set dao-treasury (- (var-get dao-treasury) total-reward))
+    (ok bounty-id)
+  )
+)
+
+(define-private (create-milestone-entry 
+  (desc (string-ascii 300)) 
+  (reward uint) 
+  (deadline uint) 
+  (bounty-id uint) 
+  (index uint))
+  (begin
+    (map-set milestones
+      { bounty-id: bounty-id, milestone-index: index }
+      {
+        description: desc,
+        reward-amount: reward,
+        deadline: deadline,
+        status: "pending",
+        submission-url: none,
+        submitted-at: none,
+        completed-at: none
+      }
+    )
+    true
+  )
+)
+
+(define-public (submit-milestone-completion (bounty-id uint) (milestone-index uint) (submission-url (string-ascii 200)))
+  (let (
+    (bounty-data (map-get? milestone-bounties { bounty-id: bounty-id }))
+    (milestone-data (map-get? milestones { bounty-id: bounty-id, milestone-index: milestone-index }))
+  )
+    (asserts! (is-some bounty-data) ERR_BOUNTY_NOT_FOUND)
+    (asserts! (is-some milestone-data) ERR_MILESTONE_NOT_FOUND)
+    (let (
+      (bounty (unwrap-panic bounty-data))
+      (milestone (unwrap-panic milestone-data))
+    )
+      (asserts! (is-eq tx-sender (get assignee bounty)) ERR_NOT_AUTHORIZED)
+      (asserts! (is-eq (get status milestone) "pending") ERR_MILESTONE_COMPLETED)
+      (asserts! (is-eq (get status bounty) "active") ERR_BOUNTY_ACTIVE)
+      
+      (map-set milestones
+        { bounty-id: bounty-id, milestone-index: milestone-index }
+        {
+          description: (get description milestone),
+          reward-amount: (get reward-amount milestone),
+          deadline: (get deadline milestone),
+          status: "submitted",
+          submission-url: (some submission-url),
+          submitted-at: (some stacks-block-height),
+          completed-at: none
+        }
+      )
+      (ok "Milestone submitted for review")
+    )
+  )
+)
+
+(define-public (approve-milestone (bounty-id uint) (milestone-index uint))
+  (let (
+    (bounty-data (map-get? milestone-bounties { bounty-id: bounty-id }))
+    (milestone-data (map-get? milestones { bounty-id: bounty-id, milestone-index: milestone-index }))
+  )
+    (asserts! (is-some bounty-data) ERR_BOUNTY_NOT_FOUND)
+    (asserts! (is-some milestone-data) ERR_MILESTONE_NOT_FOUND)
+    (let (
+      (bounty (unwrap-panic bounty-data))
+      (milestone (unwrap-panic milestone-data))
+    )
+      (asserts! (is-eq tx-sender (get creator bounty)) ERR_NOT_AUTHORIZED)
+      (asserts! (is-eq (get status milestone) "submitted") ERR_MILESTONE_NOT_SUBMITTED)
+      (asserts! (is-eq (get status bounty) "active") ERR_BOUNTY_ACTIVE)
+      
+      (try! (as-contract (stx-transfer? (get reward-amount milestone) tx-sender (get assignee bounty))))
+      
+      (map-set milestones
+        { bounty-id: bounty-id, milestone-index: milestone-index }
+        {
+          description: (get description milestone),
+          reward-amount: (get reward-amount milestone),
+          deadline: (get deadline milestone),
+          status: "completed",
+          submission-url: (get submission-url milestone),
+          submitted-at: (get submitted-at milestone),
+          completed-at: (some stacks-block-height)
+        }
+      )
+      
+      (let ((new-completed (+ (get completed-milestones bounty) u1)))
+        (map-set milestone-bounties
+          { bounty-id: bounty-id }
+          {
+            creator: (get creator bounty),
+            title: (get title bounty),
+            description: (get description bounty),
+            total-reward: (get total-reward bounty),
+            assignee: (get assignee bounty),
+            total-milestones: (get total-milestones bounty),
+            completed-milestones: new-completed,
+            created-at: (get created-at bounty),
+            status: (if (is-eq new-completed (get total-milestones bounty)) "completed" "active")
+          }
+        )
+        
+        (if (is-eq new-completed (get total-milestones bounty))
+          (let ((assignee-data (unwrap-panic (map-get? member-registry { member: (get assignee bounty) }))))
+            (map-set member-registry
+              { member: (get assignee bounty) }
+              {
+                joined-at: (get joined-at assignee-data),
+                reputation-score: (+ (get reputation-score assignee-data) (* u5 (get total-milestones bounty))),
+                total-submissions: (get total-submissions assignee-data),
+                total-rewards: (+ (get total-rewards assignee-data) (get total-reward bounty))
+              }
+            )
+          )
+          true
+        )
+      )
+      (ok "Milestone approved and payment released")
+    )
+  )
+)
+
+(define-read-only (get-milestone-bounty (bounty-id uint))
+  (map-get? milestone-bounties { bounty-id: bounty-id })
+)
+
+(define-read-only (get-milestone-info (bounty-id uint) (milestone-index uint))
+  (map-get? milestones { bounty-id: bounty-id, milestone-index: milestone-index })
+)
+
+(define-read-only (get-milestone-progress (bounty-id uint))
+  (let ((bounty-data (map-get? milestone-bounties { bounty-id: bounty-id })))
+    (if (is-some bounty-data)
+      (let ((bounty (unwrap-panic bounty-data)))
+        (ok {
+          completed: (get completed-milestones bounty),
+          total: (get total-milestones bounty),
+          status: (get status bounty)
+        })
+      )
+      ERR_BOUNTY_NOT_FOUND
+    )
+  )
 )
