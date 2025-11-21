@@ -11,15 +11,23 @@
 (define-constant ERR_MILESTONE_COMPLETED (err u407))
 (define-constant ERR_INVALID_MILESTONE (err u408))
 (define-constant ERR_MILESTONE_NOT_SUBMITTED (err u409))
+(define-constant ERR_DISPUTE_NOT_FOUND (err u412))
+(define-constant ERR_DISPUTE_ALREADY_EXISTS (err u413))
+(define-constant ERR_DISPUTE_CLOSED (err u414))
+(define-constant ERR_INSUFFICIENT_REPUTATION (err u415))
 (define-constant MIN_BOUNTY_AMOUNT u1000000)
 (define-constant VOTING_PERIOD u1008)
 (define-constant MIN_VOTES_REQUIRED u3)
 (define-constant MAX_MILESTONES u10)
+(define-constant DISPUTE_VOTING_PERIOD u504)
+(define-constant MIN_DISPUTE_VOTES u5)
+(define-constant MIN_REPUTATION_TO_DISPUTE u5)
 
 (define-data-var next-bounty-id uint u1)
 (define-data-var dao-treasury uint u0)
 (define-data-var total-members uint u0)
 (define-data-var next-milestone-bounty-id uint u1)
+(define-data-var next-dispute-id uint u1)
 
 (define-map bounties
   { bounty-id: uint }
@@ -91,6 +99,29 @@
     submission-url: (optional (string-ascii 200)),
     submitted-at: (optional uint),
     completed-at: (optional uint)
+  }
+)
+
+(define-map disputes
+  { dispute-id: uint }
+  {
+    bounty-id: uint,
+    disputer: principal,
+    reason: (string-ascii 500),
+    created-at: uint,
+    voting-deadline: uint,
+    status: (string-ascii 20),
+    votes-for: uint,
+    votes-against: uint,
+    resolved-at: (optional uint)
+  }
+)
+
+(define-map dispute-votes
+  { dispute-id: uint, voter: principal }
+  {
+    vote: bool,
+    voted-at: uint
   }
 )
 
@@ -506,4 +537,203 @@
       ERR_BOUNTY_NOT_FOUND
     )
   )
+)
+
+(define-public (create-dispute (bounty-id uint) (reason (string-ascii 500)))
+  (let (
+    (dispute-id (var-get next-dispute-id))
+    (bounty-data (map-get? bounties { bounty-id: bounty-id }))
+    (member-data (map-get? member-registry { member: tx-sender }))
+    (submission-data (map-get? bounty-submissions { bounty-id: bounty-id, submitter: tx-sender }))
+    (existing-dispute-check (fold check-existing-dispute 
+      (list u1 u2 u3 u4 u5 u6 u7 u8 u9 u10)
+      { bounty: bounty-id, sender: tx-sender, found: false }))
+  )
+    (asserts! (is-some bounty-data) ERR_BOUNTY_NOT_FOUND)
+    (asserts! (is-some member-data) ERR_NOT_MEMBER)
+    (asserts! (is-some submission-data) ERR_BOUNTY_NOT_FOUND)
+    (asserts! (>= (get reputation-score (unwrap-panic member-data)) MIN_REPUTATION_TO_DISPUTE) ERR_INSUFFICIENT_REPUTATION)
+    (asserts! (not (get found existing-dispute-check)) ERR_DISPUTE_ALREADY_EXISTS)
+    
+    (let ((bounty (unwrap-panic bounty-data)))
+      (asserts! (is-eq (get status bounty) "completed") ERR_BOUNTY_ACTIVE)
+      (asserts! (not (is-eq (some tx-sender) (get winner bounty))) ERR_NOT_AUTHORIZED)
+      
+      (map-set disputes
+        { dispute-id: dispute-id }
+        {
+          bounty-id: bounty-id,
+          disputer: tx-sender,
+          reason: reason,
+          created-at: stacks-block-height,
+          voting-deadline: (+ stacks-block-height DISPUTE_VOTING_PERIOD),
+          status: "active",
+          votes-for: u0,
+          votes-against: u0,
+          resolved-at: none
+        }
+      )
+      (var-set next-dispute-id (+ dispute-id u1))
+      (ok dispute-id)
+    )
+  )
+)
+
+(define-private (check-existing-dispute (id uint) (acc { bounty: uint, sender: principal, found: bool }))
+  (if (get found acc)
+    acc
+    (let ((dispute-data (map-get? disputes { dispute-id: id })))
+      (if (is-some dispute-data)
+        (let ((dispute (unwrap-panic dispute-data)))
+          (if (and 
+                (is-eq (get bounty-id dispute) (get bounty acc))
+                (is-eq (get disputer dispute) (get sender acc))
+                (or (is-eq (get status dispute) "active") (is-eq (get status dispute) "pending")))
+            { bounty: (get bounty acc), sender: (get sender acc), found: true }
+            acc
+          )
+        )
+        acc
+      )
+    )
+  )
+)
+
+(define-public (vote-on-dispute (dispute-id uint) (vote-for bool))
+  (let (
+    (dispute-data (map-get? disputes { dispute-id: dispute-id }))
+    (member-data (map-get? member-registry { member: tx-sender }))
+    (existing-vote (map-get? dispute-votes { dispute-id: dispute-id, voter: tx-sender }))
+  )
+    (asserts! (is-some dispute-data) ERR_DISPUTE_NOT_FOUND)
+    (asserts! (is-some member-data) ERR_NOT_MEMBER)
+    (asserts! (is-none existing-vote) ERR_ALREADY_VOTED)
+    
+    (let ((dispute (unwrap-panic dispute-data)))
+      (asserts! (is-eq (get status dispute) "active") ERR_DISPUTE_CLOSED)
+      (asserts! (< stacks-block-height (get voting-deadline dispute)) ERR_BOUNTY_EXPIRED)
+      
+      (map-set dispute-votes
+        { dispute-id: dispute-id, voter: tx-sender }
+        {
+          vote: vote-for,
+          voted-at: stacks-block-height
+        }
+      )
+      
+      (map-set disputes
+        { dispute-id: dispute-id }
+        {
+          bounty-id: (get bounty-id dispute),
+          disputer: (get disputer dispute),
+          reason: (get reason dispute),
+          created-at: (get created-at dispute),
+          voting-deadline: (get voting-deadline dispute),
+          status: (get status dispute),
+          votes-for: (if vote-for (+ (get votes-for dispute) u1) (get votes-for dispute)),
+          votes-against: (if vote-for (get votes-against dispute) (+ (get votes-against dispute) u1)),
+          resolved-at: (get resolved-at dispute)
+        }
+      )
+      (ok "Vote recorded")
+    )
+  )
+)
+
+(define-public (resolve-dispute (dispute-id uint))
+  (let ((dispute-data (map-get? disputes { dispute-id: dispute-id })))
+    (asserts! (is-some dispute-data) ERR_DISPUTE_NOT_FOUND)
+    
+    (let ((dispute (unwrap-panic dispute-data)))
+      (asserts! (is-eq (get status dispute) "active") ERR_DISPUTE_CLOSED)
+      (asserts! (>= stacks-block-height (get voting-deadline dispute)) ERR_BOUNTY_ACTIVE)
+      
+      (let (
+        (total-votes (+ (get votes-for dispute) (get votes-against dispute)))
+        (dispute-approved (and (>= total-votes MIN_DISPUTE_VOTES) (> (get votes-for dispute) (get votes-against dispute))))
+        (bounty-data (map-get? bounties { bounty-id: (get bounty-id dispute) }))
+      )
+        (asserts! (is-some bounty-data) ERR_BOUNTY_NOT_FOUND)
+        
+        (if dispute-approved
+          (let ((bounty (unwrap-panic bounty-data)))
+            (let ((old-winner (unwrap-panic (get winner bounty))))
+              (try! (as-contract (stx-transfer? (get reward-amount bounty) old-winner (get disputer dispute))))
+              
+              (map-set bounties
+                { bounty-id: (get bounty-id dispute) }
+                {
+                  creator: (get creator bounty),
+                  title: (get title bounty),
+                  description: (get description bounty),
+                  reward-amount: (get reward-amount bounty),
+                  deadline: (get deadline bounty),
+                  status: "completed",
+                  winner: (some (get disputer dispute)),
+                  total-votes: (get total-votes bounty),
+                  created-at: (get created-at bounty)
+                }
+              )
+              
+              (let ((old-winner-data (unwrap-panic (map-get? member-registry { member: old-winner }))))
+                (map-set member-registry
+                  { member: old-winner }
+                  {
+                    joined-at: (get joined-at old-winner-data),
+                    reputation-score: (if (>= (get reputation-score old-winner-data) u10) 
+                                        (- (get reputation-score old-winner-data) u10) 
+                                        u0),
+                    total-submissions: (get total-submissions old-winner-data),
+                    total-rewards: (- (get total-rewards old-winner-data) (get reward-amount bounty))
+                  }
+                )
+              )
+              
+              (let ((disputer-data (unwrap-panic (map-get? member-registry { member: (get disputer dispute) }))))
+                (map-set member-registry
+                  { member: (get disputer dispute) }
+                  {
+                    joined-at: (get joined-at disputer-data),
+                    reputation-score: (+ (get reputation-score disputer-data) u15),
+                    total-submissions: (get total-submissions disputer-data),
+                    total-rewards: (+ (get total-rewards disputer-data) (get reward-amount bounty))
+                  }
+                )
+              )
+            )
+          )
+          true
+        )
+        
+        (map-set disputes
+          { dispute-id: dispute-id }
+          {
+            bounty-id: (get bounty-id dispute),
+            disputer: (get disputer dispute),
+            reason: (get reason dispute),
+            created-at: (get created-at dispute),
+            voting-deadline: (get voting-deadline dispute),
+            status: (if dispute-approved "approved" "rejected"),
+            votes-for: (get votes-for dispute),
+            votes-against: (get votes-against dispute),
+            resolved-at: (some stacks-block-height)
+          }
+        )
+        
+        (ok dispute-approved)
+      )
+    )
+  )
+)
+
+(define-read-only (get-dispute (dispute-id uint))
+  (map-get? disputes { dispute-id: dispute-id })
+)
+
+(define-read-only (get-dispute-vote (dispute-id uint) (voter principal))
+  (map-get? dispute-votes { dispute-id: dispute-id, voter: voter })
+)
+
+(define-read-only (has-voted-on-dispute (dispute-id uint) (voter principal))
+  (is-some (map-get? dispute-votes { dispute-id: dispute-id, voter: voter }))
 )
